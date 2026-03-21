@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ScrollView, Image, Alert, ActivityIndicator, KeyboardAvoidingView, Platform
@@ -7,16 +7,25 @@ import * as ImagePicker from 'expo-image-picker';
 import { db, storage } from '../firebase';
 import { doc, setDoc, getDoc, updateDoc, arrayUnion, serverTimestamp } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { v4 as uuidv4 } from 'uuid';
+import { generateId } from '../utils';
 import { colors, AVATAR_EMOJIS } from '../theme';
 
-const genCode = () => Math.random().toString(36).substr(2, 6).toUpperCase();
+// 방 코드 생성 후 중복 확인
+const genUniqueCode = async () => {
+  for (let i = 0; i < 10; i++) {
+    const code = Math.random().toString(36).substr(2, 6).toUpperCase();
+    const snap = await getDoc(doc(db, 'rooms', code));
+    if (!snap.exists()) return code;
+  }
+  return Math.random().toString(36).substr(2, 8).toUpperCase(); // 8자리 폴백
+};
 
-export default function SetupScreen({ onEnter }) {
+export default function SetupScreen({ onEnter, savedMe }) {
   const [tab, setTab] = useState('create');
-  const [nick, setNick] = useState('');
+  // savedMe가 있으면 기존 정보 자동 채우기 (버그 #3 수정)
+  const [nick, setNick] = useState(savedMe?.nick || '');
   const [roomCode, setRoomCode] = useState('');
-  const [avatarEmoji, setAvatarEmoji] = useState(AVATAR_EMOJIS[0]);
+  const [avatarEmoji, setAvatarEmoji] = useState(savedMe?.emoji || AVATAR_EMOJIS[0]);
   const [avatarUri, setAvatarUri] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -31,7 +40,7 @@ export default function SetupScreen({ onEnter }) {
   };
 
   const uploadAvatar = async (userId) => {
-    if (!avatarUri) return '';
+    if (!avatarUri) return savedMe?.photoURL || '';
     const response = await fetch(avatarUri);
     const blob = await response.blob();
     const storageRef = ref(storage, `avatars/${userId}`);
@@ -44,12 +53,18 @@ export default function SetupScreen({ onEnter }) {
     if (tab === 'join' && roomCode.trim().length < 4) { Alert.alert('방 코드를 입력해주세요'); return; }
     setLoading(true);
     try {
-      const userId = uuidv4();
+      // savedMe가 있고 프로필 변경 없으면 기존 ID 유지
+      const userId = savedMe?.id || generateId();
       const photoURL = await uploadAvatar(userId);
-      const member = { id: userId, nick: nick.trim(), photoURL, emoji: avatarEmoji };
+      const member = {
+        id: userId,
+        nick: nick.trim(),
+        photoURL,
+        emoji: avatarEmoji,
+      };
 
       if (tab === 'create') {
-        const code = genCode();
+        const code = await genUniqueCode(); // 중복 확인 (버그 #5 수정)
         await setDoc(doc(db, 'rooms', code), {
           code, members: [member], createdAt: serverTimestamp(),
         });
@@ -59,9 +74,21 @@ export default function SetupScreen({ onEnter }) {
         const snap = await getDoc(doc(db, 'rooms', code));
         if (!snap.exists()) { Alert.alert('방을 찾을 수 없어요'); setLoading(false); return; }
         const data = snap.data();
-        if (data.members.length >= 2) { Alert.alert('이미 2명이 입장한 방이에요'); setLoading(false); return; }
-        await updateDoc(doc(db, 'rooms', code), { members: arrayUnion(member) });
-        onEnter({ roomCode: code, me: member });
+        const members = data.members || [];
+
+        // ID 기반 재입장 확인 (닉네임 아님 — 보안 버그 #2 수정)
+        const existingById = members.find(m => m.id === member.id);
+        if (existingById) {
+          onEnter({ roomCode: code, me: existingById });
+        } else {
+          if (members.length >= 2) {
+            Alert.alert('입장 불가', '이미 2명이 입장한 방이에요');
+            setLoading(false);
+            return;
+          }
+          await updateDoc(doc(db, 'rooms', code), { members: arrayUnion(member) });
+          onEnter({ roomCode: code, me: member });
+        }
       }
     } catch (e) {
       console.error(e);
@@ -70,16 +97,16 @@ export default function SetupScreen({ onEnter }) {
     setLoading(false);
   };
 
+  const currentPhoto = avatarUri || savedMe?.photoURL;
+
   return (
     <KeyboardAvoidingView style={s.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
-        {/* Logo */}
         <View style={s.logo}>
           <Text style={s.logoIcon}>💬</Text>
           <Text style={s.logoText}>DuoChat</Text>
         </View>
 
-        {/* Tabs */}
         <View style={s.tabs}>
           <TouchableOpacity style={[s.tab, tab==='create' && s.tabActive]} onPress={() => setTab('create')}>
             <Text style={[s.tabText, tab==='create' && s.tabTextActive]}>방 만들기</Text>
@@ -89,24 +116,23 @@ export default function SetupScreen({ onEnter }) {
           </TouchableOpacity>
         </View>
 
-        {/* Avatar */}
         <View style={s.section}>
           <Text style={s.label}>프로필</Text>
           <View style={s.avatarRow}>
             <TouchableOpacity onPress={pickImage} style={s.avatarCircle}>
-              {avatarUri
-                ? <Image source={{ uri: avatarUri }} style={s.avatarImg}/>
+              {currentPhoto
+                ? <Image source={{ uri: currentPhoto }} style={s.avatarImg}/>
                 : <Text style={s.avatarEmoji}>{avatarEmoji}</Text>
               }
             </TouchableOpacity>
             <View style={s.avatarRight}>
               <TouchableOpacity style={s.uploadBtn} onPress={pickImage}>
-                <Text style={s.uploadBtnText}>사진 선택</Text>
+                <Text style={s.uploadBtnText}>사진 변경</Text>
               </TouchableOpacity>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
                 {AVATAR_EMOJIS.map(e => (
                   <TouchableOpacity key={e} onPress={() => { setAvatarEmoji(e); setAvatarUri(null); }}
-                    style={[s.emojiOpt, avatarEmoji === e && !avatarUri && s.emojiOptActive]}>
+                    style={[s.emojiOpt, avatarEmoji === e && !currentPhoto && s.emojiOptActive]}>
                     <Text style={{ fontSize: 22 }}>{e}</Text>
                   </TouchableOpacity>
                 ))}
@@ -115,14 +141,12 @@ export default function SetupScreen({ onEnter }) {
           </View>
         </View>
 
-        {/* Nickname */}
         <View style={s.section}>
           <Text style={s.label}>닉네임</Text>
           <TextInput style={s.input} placeholder="나를 뭐라고 부를까요?" placeholderTextColor={colors.text3}
             value={nick} onChangeText={setNick} maxLength={12} returnKeyType="done"/>
         </View>
 
-        {/* Room code (join only) */}
         {tab === 'join' && (
           <View style={s.section}>
             <Text style={s.label}>방 코드</Text>
@@ -132,7 +156,6 @@ export default function SetupScreen({ onEnter }) {
           </View>
         )}
 
-        {/* Submit */}
         <TouchableOpacity style={s.btn} onPress={handleStart} disabled={loading}>
           {loading
             ? <ActivityIndicator color="#fff"/>
@@ -183,10 +206,7 @@ const s = StyleSheet.create({
     borderRadius: 10, padding: 13, color: colors.text, fontSize: 15, width: '100%',
   },
   codeInput: { fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', letterSpacing: 4, fontSize: 18 },
-  btn: {
-    width: '100%', paddingVertical: 14, backgroundColor: colors.accent,
-    borderRadius: 10, alignItems: 'center', marginTop: 8,
-  },
+  btn: { width: '100%', paddingVertical: 14, backgroundColor: colors.accent, borderRadius: 10, alignItems: 'center', marginTop: 8 },
   btnText: { color: '#fff', fontSize: 15, fontWeight: '600' },
   hint: { fontSize: 12, color: colors.text3, textAlign: 'center', marginTop: 16 },
 });
