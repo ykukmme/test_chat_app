@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "DuoChat",
+    "slug": "duo-chat-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0e0e10"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0e0e10"
+      },
+      "package": "com.duochat.app",
+      "permissions": [
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "CAMERA",
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "WRITE_EXTERNAL_STORAGE"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "사진을 선택하기 위해 갤러리 접근이 필요해요.",
+          "cameraPermission": "사진을 촬영하기 위해 카메라 접근이 필요해요."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "다운로드한 미디어를 갤러리에 저장하기 위해 접근이 필요해요."
+        }
+      ]
+    ]
+  }
+}
