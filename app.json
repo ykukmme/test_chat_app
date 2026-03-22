@@ -17,16 +17,27 @@
         "backgroundColor": "#0e0e10"
       },
       "package": "com.duochat.app",
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "READ_EXTERNAL_STORAGE",
         "WRITE_EXTERNAL_STORAGE",
         "CAMERA",
         "READ_MEDIA_IMAGES",
         "READ_MEDIA_VIDEO",
-        "WRITE_EXTERNAL_STORAGE"
+        "VIBRATE",
+        "RECEIVE_BOOT_COMPLETED"
       ]
     },
     "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#7c6aff",
+          "androidMode": "default",
+          "androidCollapsedTitle": "DuoChat"
+        }
+      ],
       [
         "expo-image-picker",
         {
@@ -40,6 +51,11 @@
           "photosPermission": "다운로드한 미디어를 갤러리에 저장하기 위해 접근이 필요해요."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "YOUR_EXPO_PROJECT_ID"
+      }
+    }
   }
 }

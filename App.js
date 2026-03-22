@@ -53,16 +53,20 @@ function AppInner() {
     })();
   }, []);
 
-  // 알림 탭 시 해당 방으로 이동
+  // 알림 탭 시 해당 방으로 이동 — useRef로 me 최신값 참조 (클로저 stale 방지)
+  const meRef = React.useRef(me);
+  useEffect(() => { meRef.current = me; }, [me]);
+
   useEffect(() => {
     const cleanup = setupNotificationListeners((roomCode) => {
-      if (me) {
-        setChatSession({ roomCode, me });
+      const currentMe = meRef.current;
+      if (currentMe) {
+        setChatSession({ roomCode, me: currentMe });
         setScreen('chat');
       }
     });
     return cleanup;
-  }, [me]);
+  }, []); // 마운트 시 1회만 등록
 
   const handleSetupDone = async (session) => {
     await saveMe(session.me);

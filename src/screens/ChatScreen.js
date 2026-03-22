@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet,
   Image, KeyboardAvoidingView, Platform, Alert,
-  Modal, Pressable, Dimensions, AppState,
+  Modal, Pressable, Dimensions, AppState, ScrollView, ActivityIndicator,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';   // deprecated RN Clipboard 대체
 import { Video } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
@@ -13,9 +14,9 @@ import * as FileSystem from 'expo-file-system';
 import { db, storage } from '../firebase';
 import {
   collection, addDoc, query, orderBy, onSnapshot,
-  serverTimestamp, doc, onSnapshot as onDocSnap, updateDoc, setDoc,
+  serverTimestamp, doc, onSnapshot as onDocSnap, updateDoc, getDoc,
 } from 'firebase/firestore';
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytesResumable, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { generateId } from '../utils';
 import { EMOJIS, REACT_EMOJIS } from '../theme';
 import { useTheme } from '../context/ThemeContext';
@@ -31,7 +32,7 @@ const BUBBLE_MAX = SCREEN_W * 0.68;
 const formatTime = (ts) => {
   if (!ts) return '';
   const d = ts.toDate ? ts.toDate() : new Date(ts * 1000);
-  return d.getHours().toString().padStart(2,'00') + ':' + d.getMinutes().toString().padStart(2,'00');
+  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
 };
 
 const f2 = (n) => n.toString().padStart(2,'0');
@@ -186,7 +187,34 @@ export default function ChatScreen({ session, onLeave }) {
   const [lightbox, setLightbox] = useState(null);
   const [reactionTarget, setReactionTarget] = useState(null);
   const flatRef = useRef();
-  const meIdRef = useRef(me.id);  // 클로저에서 안전하게 me.id 참조
+  const meIdRef = useRef(me.id);
+
+  // ── 프로필 수정 상태 ────────────────────────────────────────
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [editNick, setEditNick] = useState(me.nick);
+  const [editEmoji, setEditEmoji] = useState(me.emoji || '🐱');
+  const [editAvatarUri, setEditAvatarUri] = useState(null);
+  const [editAvatarPreview, setEditAvatarPreview] = useState(me.photoURL || '');
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [currentMe, setCurrentMe] = useState(me); // 로컬 me 상태 (수정 후 즉시 반영)
+
+  // 방별 프로필 로드 — 이 방에서 커스텀 프로필을 설정한 적 있으면 우선 적용
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem('room_profile_' + roomCode);
+        if (raw) {
+          const roomProfile = JSON.parse(raw);
+          if (roomProfile.id === me.id) {
+            setCurrentMe(roomProfile);
+            setEditNick(roomProfile.nick);
+            setEditEmoji(roomProfile.emoji || '🐱');
+            setEditAvatarPreview(roomProfile.photoURL || '');
+          }
+        }
+      } catch (e) {}
+    })();
+  }, [roomCode]);
 
   // 푸시 토큰 등록
   useEffect(() => {
@@ -271,13 +299,13 @@ export default function ChatScreen({ session, onLeave }) {
     setEmojiOpen(false);
     setMediaOpen(false);
     const msgData = {
-      senderId: me.id, senderNick: me.nick,
+      senderId: me.id, senderNick: currentMe.nick,
       text: msgText, mediaURL, mediaType,
       reactions: {}, createdAt: serverTimestamp(),
     };
     try {
       await addDoc(collection(db, 'rooms', roomCode, 'messages'), msgData);
-      if (theirToken) await sendPushNotification(theirToken, me.nick, { ...msgData, roomCode });
+      if (theirToken) await sendPushNotification(theirToken, currentMe.nick, { ...msgData, roomCode });
     } catch (e) {
       // 전송 실패 시 텍스트 복원
       if (msgText) setText(msgText);
@@ -382,13 +410,78 @@ export default function ChatScreen({ session, onLeave }) {
     ? <View style={{ alignItems:'center', marginVertical:14 }}>
         <Text style={{ fontSize:12, color:theme.text3, backgroundColor:theme.bg2, paddingHorizontal:12, paddingVertical:4, borderRadius:12 }}>{item.label}</Text>
       </View>
-    : <MessageRow msg={item} me={me} them={them} theme={theme}
+    : <MessageRow msg={item} me={currentMe} them={them} theme={theme}
         onLongPress={id => setReactionTarget(reactionTarget === id ? null : id)}
         onImagePress={msg => setLightbox({ url: msg.mediaURL, type: msg.mediaType })}
         onDownload={downloadMedia}
         reactionOpen={reactionTarget === item.id}
         onReactionAdd={addReaction}
         onReactionToggle={id => setReactionTarget(reactionTarget === id ? null : id)} />;
+
+  // ── 프로필 수정 ──────────────────────────────────────────
+  const pickProfileImage = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') { Alert.alert('갤러리 권한이 필요해요'); return; }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true, aspect: [1,1], quality: 0.7,
+    });
+    if (!result.canceled) {
+      setEditAvatarUri(result.assets[0].uri);
+      setEditAvatarPreview(result.assets[0].uri);
+    }
+  };
+
+  const saveProfile = async () => {
+    if (!editNick.trim()) { Alert.alert('닉네임을 입력해주세요'); return; }
+    setSavingProfile(true);
+    try {
+      let photoURL = editAvatarPreview;
+
+      // 새 사진 선택 시 방별 경로로 업로드 (전역 아바타와 분리)
+      if (editAvatarUri) {
+        const response = await fetch(editAvatarUri);
+        const blob = await response.blob();
+        // 방별 아바타: avatars/{userId}/{roomCode}
+        const storageRef = ref(storage, `avatars/${currentMe.id}/${roomCode}`);
+        await uploadBytes(storageRef, blob);
+        photoURL = await getDownloadURL(storageRef);
+      }
+
+      const updatedMe = {
+        ...currentMe,
+        nick: editNick.trim(),
+        emoji: editEmoji,
+        photoURL,
+      };
+
+      // Firestore: 이 방의 members에서만 내 정보 업데이트
+      const roomSnap = await getDoc(doc(db, 'rooms', roomCode));
+      if (roomSnap.exists()) {
+        const members = (roomSnap.data().members || []).map(m =>
+          m.id === currentMe.id
+            ? { ...m, nick: updatedMe.nick, emoji: updatedMe.emoji, photoURL: updatedMe.photoURL }
+            : m
+        );
+        await updateDoc(doc(db, 'rooms', roomCode), { members });
+      }
+
+      // 방별 로컬 프로필 저장 (전역 my_profile_v1은 건드리지 않음)
+      await AsyncStorage.setItem(
+'room_profile_' + roomCode,
+        JSON.stringify(updatedMe)
+      );
+
+      setCurrentMe(updatedMe);
+      setEditAvatarUri(null);
+      setProfileModalOpen(false);
+      Alert.alert('저장됐어요!', '이 채팅방에서만 적용되는 프로필이에요.');
+    } catch (e) {
+      Alert.alert('저장 실패', e.message);
+    } finally {
+      setSavingProfile(false);
+    }
+  };
 
   const copyCode = async () => {
     await Clipboard.setStringAsync(roomCode);  // expo-clipboard 사용 (버그 #7 수정)
@@ -402,6 +495,7 @@ export default function ChatScreen({ session, onLeave }) {
         <TouchableOpacity onPress={() => Alert.alert('나가기','채팅방을 나가시겠어요?',[{text:'취소'},{text:'나가기',style:'destructive',onPress:onLeave}])} style={{ padding:4 }}>
           <Text style={{ fontSize:20, color:theme.accent }}>‹</Text>
         </TouchableOpacity>
+        {/* 상대방 아바타 */}
         <View style={{ width:38, height:38, borderRadius:19, backgroundColor:theme.bg3, alignItems:'center', justifyContent:'center', overflow:'hidden' }}>
           {them?.photoURL
             ? <Image source={{ uri:them.photoURL }} style={{ width:38, height:38, borderRadius:19 }}/>
@@ -410,13 +504,24 @@ export default function ChatScreen({ session, onLeave }) {
         <View style={{ flex:1 }}>
           <Text style={{ fontSize:15, fontWeight:'600', color:theme.text }}>{them?.nick||'상대방 기다리는 중...'}</Text>
           <View style={{ flexDirection:'row', alignItems:'center', gap:5 }}>
-            {/* 실제 lastSeen 기반 온라인 표시 (버그 #1 수정) */}
             <View style={{ width:6, height:6, borderRadius:3, backgroundColor: isOnline ? theme.green : theme.text3 }}/>
             <Text style={{ fontSize:12, color: isOnline ? theme.green : theme.text3 }}>{isOnline ? '온라인' : '오프라인'}</Text>
           </View>
         </View>
         <TouchableOpacity style={{ paddingHorizontal:9, paddingVertical:5, backgroundColor:theme.bg3, borderRadius:6, borderWidth:0.5, borderColor:theme.border }} onPress={copyCode}>
           <Text style={{ fontSize:11, color:theme.text2, letterSpacing:1, fontFamily:Platform.OS==='ios'?'Courier':'monospace' }}>{roomCode}</Text>
+        </TouchableOpacity>
+        {/* 내 아바타 — 탭하면 프로필 수정 */}
+        <TouchableOpacity onPress={() => {
+          setEditNick(currentMe.nick);
+          setEditEmoji(currentMe.emoji || '🐱');
+          setEditAvatarUri(null);
+          setEditAvatarPreview(currentMe.photoURL || '');
+          setProfileModalOpen(true);
+        }} style={{ width:34, height:34, borderRadius:17, backgroundColor:theme.bg3, alignItems:'center', justifyContent:'center', overflow:'hidden', borderWidth:1.5, borderColor:theme.accent }}>
+          {currentMe.photoURL
+            ? <Image source={{ uri:currentMe.photoURL }} style={{ width:34, height:34, borderRadius:17 }}/>
+            : <Text style={{ fontSize:17 }}>{currentMe.emoji||'🐱'}</Text>}
         </TouchableOpacity>
       </View>
 
@@ -490,6 +595,96 @@ export default function ChatScreen({ session, onLeave }) {
           </View>
         )}
       </KeyboardAvoidingView>
+
+      {/* ── 프로필 수정 모달 ─────────────────────────────── */}
+      <Modal visible={profileModalOpen} transparent animationType="fade" onRequestClose={() => setProfileModalOpen(false)}>
+        <Pressable style={{ flex:1, backgroundColor:'rgba(0,0,0,0.6)', justifyContent:'flex-end' }} onPress={() => setProfileModalOpen(false)}>
+          <Pressable onPress={e => e.stopPropagation()}>
+            <View style={{ backgroundColor:theme.bg2, borderTopLeftRadius:20, borderTopRightRadius:20, padding:24, gap:18 }}>
+              {/* 핸들 */}
+              <View style={{ width:40, height:4, borderRadius:2, backgroundColor:theme.bg4, alignSelf:'center', marginTop:-8 }}/>
+              <Text style={{ fontSize:17, fontWeight:'600', color:theme.text, textAlign:'center' }}>이 방 프로필 수정</Text>
+              <Text style={{ fontSize:12, color:theme.text3, textAlign:'center', marginTop:-10 }}>이 채팅방에서만 적용돼요</Text>
+
+              {/* 기본 프로필로 되돌리기 */}
+              <TouchableOpacity
+                onPress={async () => {
+                  try {
+                    await AsyncStorage.removeItem('room_profile_' + roomCode);
+                    setCurrentMe(me);
+                    setEditNick(me.nick);
+                    setEditEmoji(me.emoji || '🐱');
+                    setEditAvatarPreview(me.photoURL || '');
+                    setEditAvatarUri(null);
+                    // Firestore도 기본 프로필로 복원
+                    const roomSnap = await getDoc(doc(db, 'rooms', roomCode));
+                    if (roomSnap.exists()) {
+                      const members = (roomSnap.data().members || []).map(m =>
+                        m.id === me.id ? { ...m, nick: me.nick, emoji: me.emoji, photoURL: me.photoURL } : m
+                      );
+                      await updateDoc(doc(db, 'rooms', roomCode), { members });
+                    }
+                    setProfileModalOpen(false);
+                    Alert.alert('복원됐어요', '기본 프로필로 돌아왔어요.');
+                  } catch(e) {}
+                }}
+                style={{ alignSelf:'center', paddingVertical:5, paddingHorizontal:12, borderRadius:20, borderWidth:0.5, borderColor:theme.border }}>
+                <Text style={{ fontSize:12, color:theme.text3 }}>기본 프로필로 되돌리기</Text>
+              </TouchableOpacity>
+
+              {/* 아바타 수정 */}
+              <View style={{ alignItems:'center', gap:12 }}>
+                <TouchableOpacity onPress={pickProfileImage} style={{ width:80, height:80, borderRadius:40, backgroundColor:theme.bg3, borderWidth:2, borderColor:theme.accent, alignItems:'center', justifyContent:'center', overflow:'hidden' }}>
+                  {editAvatarPreview
+                    ? <Image source={{ uri:editAvatarPreview }} style={{ width:80, height:80, borderRadius:40 }}/>
+                    : <Text style={{ fontSize:36 }}>{editEmoji}</Text>}
+                  <View style={{ position:'absolute', bottom:0, left:0, right:0, backgroundColor:'rgba(0,0,0,0.45)', paddingVertical:4, alignItems:'center' }}>
+                    <Text style={{ fontSize:10, color:'#fff' }}>사진 변경</Text>
+                  </View>
+                </TouchableOpacity>
+
+                {/* 이모지 선택 */}
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  {['🐱','🐶','🦊','🐼','🐨','🦁','🐸','🐧','🦋','🌸'].map(e => (
+                    <TouchableOpacity key={e} onPress={() => { setEditEmoji(e); setEditAvatarUri(null); setEditAvatarPreview(''); }}
+                      style={{ padding:6, marginHorizontal:3, borderRadius:8, backgroundColor: editEmoji===e&&!editAvatarPreview ? theme.accentBg : 'transparent' }}>
+                      <Text style={{ fontSize:26 }}>{e}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+
+              {/* 닉네임 입력 */}
+              <View>
+                <Text style={{ fontSize:11, fontWeight:'600', color:theme.text3, letterSpacing:0.8, textTransform:'uppercase', marginBottom:8 }}>닉네임</Text>
+                <TextInput
+                  style={{ backgroundColor:theme.bg3, borderWidth:0.5, borderColor:theme.border, borderRadius:10, padding:13, color:theme.text, fontSize:15 }}
+                  value={editNick}
+                  onChangeText={setEditNick}
+                  placeholder="닉네임"
+                  placeholderTextColor={theme.text3}
+                  maxLength={12}
+                />
+              </View>
+
+              {/* 버튼 */}
+              <View style={{ flexDirection:'row', gap:10 }}>
+                <TouchableOpacity style={{ flex:1, paddingVertical:13, backgroundColor:theme.bg3, borderRadius:10, alignItems:'center' }}
+                  onPress={() => setProfileModalOpen(false)}>
+                  <Text style={{ fontSize:15, fontWeight:'600', color:theme.text2 }}>취소</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={{ flex:1, paddingVertical:13, backgroundColor:theme.accent, borderRadius:10, alignItems:'center', opacity:savingProfile?0.6:1 }}
+                  onPress={saveProfile} disabled={savingProfile}>
+                  {savingProfile
+                    ? <ActivityIndicator color="#fff" size="small"/>
+                    : <Text style={{ fontSize:15, fontWeight:'600', color:'#fff' }}>저장</Text>}
+                </TouchableOpacity>
+              </View>
+              <View style={{ height: Platform.OS==='ios'?20:0 }}/>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
 
       {/* 라이트박스 */}
       <Modal visible={!!lightbox} transparent animationType="fade" onRequestClose={() => setLightbox(null)}>
